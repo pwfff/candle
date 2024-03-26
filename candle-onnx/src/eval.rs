@@ -1,7 +1,7 @@
 use crate::onnx;
 use crate::onnx::attribute_proto::AttributeType;
 use crate::onnx::tensor_proto::DataType;
-use candle::{bail, DType, Device, Result, Tensor};
+use candle::{bail, DType, Device, IndexOp, Result, Tensor};
 use std::collections::HashMap;
 
 pub type Value = Tensor;
@@ -230,6 +230,65 @@ pub fn simple_eval(
         };
         // TODO: Validate node.input for each operator.
         match node.op_type.as_str() {
+            "Exp" => {
+                let input = get(&node.input[0])?;
+                let output = input.exp()?;
+                values.insert(node.output[0].clone(), output);
+            }
+            "Slice" => {
+                let data = get(&node.input[0])?;
+                let starts = get_attr::<[i64]>(node, "starts")?;
+                let ends = get_attr::<[i64]>(node, "ends")?;
+                let axes = get_attr_opt::<[i64]>(node, "axes")?;
+                let steps = get_attr_opt::<[i64]>(node, "steps")?;
+
+                println!("starts {starts:?} ends {ends:?} axes {axes:?}");
+
+                if steps.is_some() {
+                    bail!("unsupported steps for Slice")
+                }
+
+                // need n-dimensional set of indices to pull data from, so starts/ends of 0, 10 becomes [0, 1, ..., 9] for all dims
+                if let Some(axes) = axes {
+                    let mut slices: Vec<std::ops::Range<usize>> =
+                        data.dims().iter().map(|a| 0..*a).collect();
+                    for (s, (e, a)) in starts.iter().zip(ends.iter().zip(axes)) {
+                        slices[*a as usize] = *s as usize..(*e as usize).min(data.dims()[*a as usize])
+                    }
+                    let output = match slices.len() {
+                        1 => data.i(slices[0].clone())?,
+                        2 => data.i((
+                            slices[0].clone(),
+                            slices[1].clone(),
+                        ))?,
+                        3 => data.i((
+                            slices[0].clone(),
+                            slices[1].clone(),
+                            slices[2].clone(),
+                        ))?,
+                        _ => bail!("oops"),
+                    };
+                    println!("slices {slices:?}");
+                    println!("input dims {data:?}");
+                    println!("output dims {output:?}");
+                    values.insert(node.output[0].clone(), output);
+                } else {
+                    let output = match data.dims().len() {
+                        1 => data.i((starts[0] as usize..ends[0] as usize,))?,
+                        2 => data.i((
+                            starts[0] as usize..ends[0] as usize,
+                            starts[1] as usize..ends[1] as usize,
+                        ))?,
+                        3 => data.i((
+                            starts[0] as usize..ends[0] as usize,
+                            starts[1] as usize..ends[1] as usize,
+                            starts[2] as usize..ends[2] as usize,
+                        ))?,
+                        _ => bail!("oops"),
+                    };
+                    values.insert(node.output[0].clone(), output);
+                }
+            }
             "Add" => {
                 let input0 = get(&node.input[0])?;
                 let input1 = get(&node.input[1])?;
