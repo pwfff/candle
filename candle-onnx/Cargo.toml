@@ -12,6 +12,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 candle = { path = "../candle-core", package = "candle-core", version = "0.4.2" }
 candle-nn = { path = "../candle-nn", version = "0.4.2" }
+cartesian = "0.2.1"
 prost = "0.12.1"
 
 [build-dependencies]

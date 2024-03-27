@@ -1,8 +1,9 @@
+use cartesian::cartesian;
 use crate::onnx;
 use crate::onnx::attribute_proto::AttributeType;
 use crate::onnx::tensor_proto::DataType;
 use candle::{bail, DType, Device, IndexOp, Result, Tensor};
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::Range};
 
 pub type Value = Tensor;
 
@@ -98,7 +99,7 @@ fn get_attr_opt<'a, T: Attr + ?Sized>(
     }
 }
 
-pub fn get_tensor(t: &onnx::TensorProto, name: &str) -> Result<Tensor> {
+pub fn get_tensor(t: &onnx::TensorProto, name: &str, device: &Device) -> Result<Tensor> {
     let dims: Vec<usize> = t.dims.iter().map(|&x| x as usize).collect();
     match DataType::try_from(t.data_type) {
         Ok(DataType::Int32) => {
@@ -107,27 +108,22 @@ pub fn get_tensor(t: &onnx::TensorProto, name: &str) -> Result<Tensor> {
                 let data: &[i32] =
                     unsafe { std::slice::from_raw_parts(t.raw_data.as_ptr() as *const i32, len) };
                 let data = data.iter().map(|v| *v as i64).collect::<Vec<_>>();
-                Tensor::from_vec(data, len, &Device::Cpu)
+                Tensor::from_vec(data, len, device)
             } else {
                 let data = t.int32_data.iter().map(|v| *v as i64).collect::<Vec<_>>();
-                Tensor::from_vec(data, t.int32_data.len(), &Device::Cpu)
+                Tensor::from_vec(data, t.int32_data.len(), device)
             }
         }
         Ok(dt) => match dtype(dt) {
             Some(dt) => {
                 if dt == DType::F32 && !t.float_data.is_empty() {
-                    Tensor::from_slice(&t.float_data, dims.as_slice(), &Device::Cpu)
+                    Tensor::from_slice(&t.float_data, dims.as_slice(), device)
                 } else if dt == DType::F64 && !t.double_data.is_empty() {
-                    Tensor::from_slice(&t.double_data, dims.as_slice(), &Device::Cpu)
+                    Tensor::from_slice(&t.double_data, dims.as_slice(), device)
                 } else if dt == DType::I64 && !t.int64_data.is_empty() {
-                    Tensor::from_slice(&t.int64_data, dims.as_slice(), &Device::Cpu)
+                    Tensor::from_slice(&t.int64_data, dims.as_slice(), device)
                 } else {
-                    Tensor::from_raw_buffer(
-                        t.raw_data.as_slice(),
-                        dt,
-                        dims.as_slice(),
-                        &Device::Cpu,
-                    )
+                    Tensor::from_raw_buffer(t.raw_data.as_slice(), dt, dims.as_slice(), device)
                 }
             }
             None => {
@@ -148,6 +144,7 @@ pub fn get_tensor(t: &onnx::TensorProto, name: &str) -> Result<Tensor> {
 pub fn simple_eval(
     model: &onnx::ModelProto,
     inputs: HashMap<String, Value>,
+    device: &Device,
 ) -> Result<HashMap<String, Value>> {
     let graph = match &model.graph {
         None => bail!("no graph defined in proto"),
@@ -155,7 +152,7 @@ pub fn simple_eval(
     };
     let mut values = inputs;
     for t in graph.initializer.iter() {
-        let tensor = get_tensor(t, t.name.as_str())?;
+        let tensor = get_tensor(t, t.name.as_str(), device)?;
         values.insert(t.name.to_string(), tensor);
     }
     for input in graph.input.iter() {
@@ -230,6 +227,67 @@ pub fn simple_eval(
         };
         // TODO: Validate node.input for each operator.
         match node.op_type.as_str() {
+            "GlobalAveragePool" => {
+                let input = get(&node.input[0])?;
+
+                let (k1, k2) = (input.dim(2)?, input.dim(3)?);
+
+                let output = input.avg_pool2d((k1, k2))?;
+                values.insert(node.output[0].clone(), output);
+            }
+            "Resize" => {
+                // just support stuff we see:
+                // - coordinate_transform_mode - align_corners
+                // - mode - linear
+                // - cubic_coeff_a
+                // - nearest_mode - floor
+
+                // sooo https://github.com/onnx/onnx/blob/8a6b70f0adcff5409b8cd65883bbbea7d6c4f4e1/onnx/reference/ops/op_resize.py#L434
+                // _interpolate_nd with fct = _linear_coeffs
+                let x = get(&node.input[0])?;
+                let roi = get(&node.input[1])?;
+                let mut scales = get(&node.input[2])?.to_vec1::<f32>()?;
+                let mut sizes = get(&node.input[3])?.to_vec1::<i64>()?;
+
+                let axes = 0..x.dims().len();
+
+                if scales.len() > 0 && sizes.len() > 0 {
+                    bail!("can't provide both scales and sizes inputs");
+                }
+
+                if sizes.len() > 0 {
+                    scales = sizes
+                        .iter()
+                        .zip(x.dims().iter())
+                        .map(|(a, b)| *a as f32 / *b as f32)
+                        .collect();
+                } else {
+                    sizes = scales
+                        .iter()
+                        .zip(x.dims().iter())
+                        .map(|(a, b)| (*a * *b as f32) as i64)
+                        .collect();
+                }
+
+                // let output = Tensor::zeros(
+                //     // todo: lol no
+                //     sizes.iter().map(|s| *s as usize).collect::<Vec<usize>>(),
+                //     DType::F32,
+                //     x.device(),
+                // )?;
+
+                // let arrays = output.dims().iter().map(|dim| 0..*dim);
+                // let coords = cartesian!(arrays);
+                // for coord in coords {
+                //     output.slice_assign(&[coord], src);
+                // }
+                // println!("{node:?} scales {scales:?} sizes {sizes:?}");
+                // x.reshape(s)
+
+                // fuck it, interpolate2d is probably good
+                let output = x.interpolate2d(sizes[2] as usize, sizes[3] as usize)?;
+                values.insert(node.output[0].clone(), output);
+            }
             "Exp" => {
                 let input = get(&node.input[0])?;
                 let output = input.exp()?;
@@ -237,57 +295,34 @@ pub fn simple_eval(
             }
             "Slice" => {
                 let data = get(&node.input[0])?;
-                let starts = get_attr::<[i64]>(node, "starts")?;
-                let ends = get_attr::<[i64]>(node, "ends")?;
-                let axes = get_attr_opt::<[i64]>(node, "axes")?;
-                let steps = get_attr_opt::<[i64]>(node, "steps")?;
+
+                // TODO: how do we check opset to find out if slice args are input or attr?
+                // let starts = get_attr::<[i64]>(node, "starts")?;
+                // let ends = get_attr::<[i64]>(node, "ends")?;
+                // let axes = get_attr_opt::<[i64]>(node, "axes")?;
+                // let steps = get_attr_opt::<[i64]>(node, "steps")?;
+                let starts = get(&node.input[1])?.to_vec1::<i64>()?;
+                let ends = get(&node.input[2])?.to_vec1::<i64>()?;
+                let axes = get(&node.input[3])?.to_vec1::<i64>()?;
 
                 println!("starts {starts:?} ends {ends:?} axes {axes:?}");
 
-                if steps.is_some() {
-                    bail!("unsupported steps for Slice")
-                }
-
                 // need n-dimensional set of indices to pull data from, so starts/ends of 0, 10 becomes [0, 1, ..., 9] for all dims
-                if let Some(axes) = axes {
-                    let mut slices: Vec<std::ops::Range<usize>> =
-                        data.dims().iter().map(|a| 0..*a).collect();
-                    for (s, (e, a)) in starts.iter().zip(ends.iter().zip(axes)) {
-                        slices[*a as usize] = *s as usize..(*e as usize).min(data.dims()[*a as usize])
-                    }
-                    let output = match slices.len() {
-                        1 => data.i(slices[0].clone())?,
-                        2 => data.i((
-                            slices[0].clone(),
-                            slices[1].clone(),
-                        ))?,
-                        3 => data.i((
-                            slices[0].clone(),
-                            slices[1].clone(),
-                            slices[2].clone(),
-                        ))?,
-                        _ => bail!("oops"),
-                    };
-                    println!("slices {slices:?}");
-                    println!("input dims {data:?}");
-                    println!("output dims {output:?}");
-                    values.insert(node.output[0].clone(), output);
-                } else {
-                    let output = match data.dims().len() {
-                        1 => data.i((starts[0] as usize..ends[0] as usize,))?,
-                        2 => data.i((
-                            starts[0] as usize..ends[0] as usize,
-                            starts[1] as usize..ends[1] as usize,
-                        ))?,
-                        3 => data.i((
-                            starts[0] as usize..ends[0] as usize,
-                            starts[1] as usize..ends[1] as usize,
-                            starts[2] as usize..ends[2] as usize,
-                        ))?,
-                        _ => bail!("oops"),
-                    };
-                    values.insert(node.output[0].clone(), output);
+                let mut slices: Vec<std::ops::Range<usize>> =
+                    data.dims().iter().map(|a| 0..*a).collect();
+                for (s, (e, a)) in starts.iter().zip(ends.iter().zip(axes)) {
+                    slices[a as usize] = *s as usize..(*e as usize).min(data.dims()[a as usize])
                 }
+                let output = match slices.len() {
+                    1 => data.i(slices[0].clone())?,
+                    2 => data.i((slices[0].clone(), slices[1].clone()))?,
+                    3 => data.i((slices[0].clone(), slices[1].clone(), slices[2].clone()))?,
+                    _ => bail!("oops"),
+                };
+                println!("slices {slices:?}");
+                println!("input dims {data:?}");
+                println!("output dims {output:?}");
+                values.insert(node.output[0].clone(), output);
             }
             "Add" => {
                 let input0 = get(&node.input[0])?;
@@ -781,7 +816,7 @@ pub fn simple_eval(
                 let output = match value.r#type() {
                     AttributeType::Tensor => {
                         let t = value.t.as_ref().unwrap();
-                        get_tensor(t, &node.name)?
+                        get_tensor(t, &node.name, device)?
                     }
                     rtype => bail!("unsupported 'value' type {rtype:?} for {}", node.name),
                 };
